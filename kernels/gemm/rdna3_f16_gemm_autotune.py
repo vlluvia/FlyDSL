@@ -149,44 +149,58 @@ def pick_tile(M, N, K):
     72 depending on how its much coarser grid happens to land. Taking the widest
     covering tile cost up to 37% (1664x1664x1024) and averaged 6.5%.
 
-    Five exceptions, in order. The first two are the wide tiles, and both are
-    about operand traffic rather than about filling the machine: a tile reads
-    ``(BM + BN) / (BM * BN)`` of A and B per output, so 128x256 moves a quarter
-    less than 128x128 and 256x256 half as much again. Measured against rocBLAS TN
-    in one thermal window, as a fraction of its time:
+    Four exceptions, in order. The first is the widest tile, and it is about
+    operand traffic rather than about filling the machine: a tile reads
+    ``(BM + BN) / (BM * BN)`` of A and B per output, so 256x256 moves half what
+    128x128 does. All four wide tiles, one thermal window, microseconds:
 
-        square      4096   8192   12288  16384  20480
-        128x128x32  0.805  0.903  0.919  0.875  0.829
-        128x256x32  0.826  0.933  0.990  0.988  0.928
-        256x256x32  0.797  0.913  0.979  1.012  0.999
+        shape             128x128  128x256  256x128  256x256
+        2048x2048x2048      223.0    237.0    257.3    294.5
+        4096x2048x8192     1598.5   1760.2   1866.7   1738.7
+        4096x4096x4096     1572.7   1627.9   1748.4   1704.0
+        6144x6144x4096     3469.3   3550.1   3669.4   3479.1
+        4096x11008x4096    4225.1   4288.8   4415.4   4225.1
+        8192x8192x8192    12995.6  12636.0  13490.8  12486.8
+        12288x12288x4096  14050.4  14191.3  14668.9  13907.5
+        16384x16384x2048  12672.9  12723.2  13048.1  12508.9
 
-    So the widest tile is not simply best: 256x256 needs roughly 32 workgroups per
-    CU before its traffic saving outweighs how coarsely its grid lands, and below
-    that 128x256 leads. Above it the order reverses and stays reversed, because
-    128x256 is the one that starts falling off as the footprint grows.
+    The mixed tiles are never the answer. 128x256 was fastest on none of the 12
+    shapes swept and 256x128 was last or next to last on all of them, so the
+    choice is only ever 128x128 against 256x256, and neither mixed tile is
+    reachable from here any more.
 
-      * 256x256x32 once the grid is worth ~32 workgroups per CU. Only reachable
+    What decides between the two is not the traffic ratio, which never moves:
+    holding 88 TFLOP/s needs 1.375 TB/s at 128x128 and 688 GB/s at 256x256
+    whatever the shape. What moves is how much of that the 96 MB of Infinity
+    Cache absorbs. While the footprint fits, 128x128 sustains 1.37 TB/s of
+    operand traffic and its finer grid wins outright -- 32% at 2048 square, still
+    8% at 4096. Once it does not fit, 128x128 saturates at that same 1.32-1.37
+    TB/s and 256x256 takes over, by 4% at 8192 square. Between roughly 2000 and
+    4000 workgroups' worth of 128x128 tiles the two land within 0.3% of each
+    other and the threshold below is arbitrary.
+
+      * 256x256x32 once the grid is worth ~5 workgroups per CU. Only reachable
         unpadded; see _TILE_OPTS for why that drags the scheduling hints with it.
-      * 128x256x32 from ~4 workgroups per CU up. Never behind 128x128x32 anywhere
-        it applies, by 2-11%.
       * 128x128x32 once the grid is worth at least ~2.5 workgroups per CU. Its
-        compute intensity wins outright there, by 5-11% over 64x64x64.
+        compute intensity wins outright there, by 5-11% over 64x64x64. Whatever
+        can run 128x256 can run this, so dropping that tile strands nothing.
       * 128x64x32 (small-K ladder only) when it lands near one workgroup per CU.
         That is the narrow band around 1024x1024, where it leads by 13-28%.
       * 32x32x64 when 64x64x64 cannot fill a quarter of the machine and K is
         long enough for the idle CUs to dominate: 256x256x4096, worth 23%.
 
-    Against the per-shape fastest tile this averages 0.6%, worst case 8.1% at
-    1152x1152x1024, where 128x128x32's grid happens to land well.
+    Against the per-shape fastest tile the small-tile half of this averages 0.6%,
+    worst case 8.1% at 1152x1152x1024, where 128x128x32's grid happens to land
+    well. The wide-tile half is within 0.3% on all 12 shapes it was fitted to,
+    and dropping 128x256 moved 15 shapes by a mean of 1.020x and a worst of
+    1.009x with nothing behind, 8 of them outside the fitted set.
     """
     feasible = dict(feasible_tiles(M, N, K))
     if not feasible:
         return _ladder_for(K)[0]
 
-    if feasible.get(TILE_256x256x32, 0) >= 32 * NUM_CU:
+    if feasible.get(TILE_256x256x32, 0) >= 5 * NUM_CU:
         return TILE_256x256x32
-    if feasible.get(TILE_128x256x32, 0) >= 4 * NUM_CU:
-        return TILE_128x256x32
     if feasible.get(TILE_128x128x32, 0) >= 2.5 * NUM_CU:
         return TILE_128x128x32
     if NUM_CU <= feasible.get(TILE_128x64x32, 0) <= 1.5 * NUM_CU:
@@ -219,8 +233,43 @@ def _tile_config(tile):
     return Config(**dict(zip(_TILE_FIELDS, tile)))
 
 
+# One whole tile per persistent workgroup. This is not Stream-K: with stream_k
+# equal to the tile count every range is exactly one tile's k, so nothing splits,
+# no partial is ever written, and the kernel is built without the workspace or
+# the flags at all. Same grid, same tiles, same order as the plain path -- only a
+# different code shape for identical work -- and yet at 128x128x32 it is faster
+# everywhere it was measured: 2048 cubed 1.030x, 4096x2048x8192 1.017x,
+# 2048x4096x8192 1.016x, 3072x3072x1024 1.009x. Why is not established. It is not
+# the extra entry barrier, which put on the plain path alone changes nothing, and
+# the emitted code is 50 lines and 3 spills *worse* than the plain path's.
+#
+# Not knowing the mechanism is why this is allowed at one tile rather than by a
+# size threshold: the effect does not generalise across tiles and going wider is
+# where it turns. 128x256x32 is a coin flip (5120 cubed 1.043x, but 4096 cubed
+# 1.004x, 4096x11008x4096 0.996x, 8192 cubed 0.989x, 12288x12288x4096 0.996x) and
+# 256x256x32 is a rout, losing 14% at both 16384x16384x2048 and x4096. The small
+# tiles lose 1-2.5% (512 square, 512x512x2048, 256x256x4096), where the whole
+# kernel is tens of microseconds and one more loop around the body never
+# amortizes.
+def persistent_wgs(M, N, K, tile):
+    reg_m, reg_n, reg_k, waves_m, waves_n = tile
+    block_m, block_n = 16 * reg_m * waves_m, 16 * reg_n * waves_n
+    if (block_m, block_n) != (128, 128) or K // (16 * reg_k) < 2:
+        return 0
+    num_tiles = -(-M // block_m) * -(-N // block_n)
+    return num_tiles if num_tiles >= 256 else 0
+
+
 @functools.lru_cache(maxsize=None)
-def _build(M, N, K, in_dtype, out_dtype, rounding, reg_m, reg_n, reg_k, waves_m, waves_n):
+def _build(M, N, K, in_dtype, out_dtype, rounding, reg_m, reg_n, reg_k, waves_m, waves_n,
+           lda, ldb, ldc):
+    opts = dict(tile_opts((reg_m, reg_n, reg_k, waves_m, waves_n)))
+    # A padded row stride and stagger are two ways to break up the same L2 set
+    # camping, so a caller who has already padded should not also pay for the
+    # stagger: at 2048 cubed, tight with stagger is 224.22 us, ld+64 without it
+    # 221.70, and the two together 227.70 -- worse than either alone.
+    if lda > K or ldb > K:
+        opts["stagger"] = 0
     launch_fn, _, _, _ = create_wmma_gemm_module(
         M,
         N,
@@ -233,7 +282,11 @@ def _build(M, N, K, in_dtype, out_dtype, rounding, reg_m, reg_n, reg_k, waves_m,
         reg_k=reg_k,
         waves_m=waves_m,
         waves_n=waves_n,
-        **tile_opts((reg_m, reg_n, reg_k, waves_m, waves_n)),
+        lda=lda,
+        ldb=ldb,
+        ldc=ldc,
+        stream_k=persistent_wgs(M, N, K, (reg_m, reg_n, reg_k, waves_m, waves_n)),
+        **opts,
     )
     return launch_fn
 
@@ -270,7 +323,10 @@ def rdna3_gemm_dispatch(
         auto if given is None else given
         for auto, given in zip(pick_tile(M, N, K), (reg_m, reg_n, reg_k, waves_m, waves_n))
     )
-    launch_fn = _build(M, N, K, in_dtype, out_dtype, rounding, *tile)
+    # Taken from the tensors rather than asked of the caller, so that handing in
+    # a row-padded slice is all it takes to get the padded kernel.
+    launch_fn = _build(M, N, K, in_dtype, out_dtype, rounding, *tile,
+                       A.stride(0), B_T.stride(0), C.stride(0))
     # A search calls this once per candidate and then once more on the winner,
     # so the last write is the config the tuner settled on.
     _resolved[(M, N, K, in_dtype, out_dtype, rounding)] = launch_fn
