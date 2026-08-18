@@ -44,9 +44,8 @@ WMMA_N = 16
 WMMA_K = 16
 WAVE_SIZE = 32
 
-# The k-padding both operands pay to break LDS bank conflicts. Also the default
-# for a_k_pad/b_k_pad below, so a caller sizing a tile against the LDS budget can
-# assume it without the two drifting apart.
+# K-padding for the "pad" LDS layout (bank conflict avoidance). The "kblock"
+# layout needs no pad; see lds_layout below.
 K_PAD = 8
 
 
@@ -135,12 +134,10 @@ def create_wmma_gemm_module(
     waves_m=2,
     waves_n=2,
     group_m=8,
-    a_k_pad=K_PAD,
-    b_k_pad=K_PAD,
     lds_layout="pad",
     sched_hint=False,
     stagger=0,
-    stream_k=0,
+    persistent_wgs=0,
     # Row strides of the operands, when the caller has room to make them
     # something other than tight. A tile reads BLOCK_K of a row at a time, which
     # at K=2048 in bf16 is a 64-byte run every 4096 bytes, and 4096 is exactly
@@ -223,9 +220,9 @@ def create_wmma_gemm_module(
     assert lds_layout in ("pad", "kblock")
     if lds_layout == "kblock":
         assert BLOCK_K % LOAD_VEC == 0
-        a_k_pad = b_k_pad = 0
-    ROW_STRIDE_A = BLOCK_K + a_k_pad
-    ROW_STRIDE_B = BLOCK_K + b_k_pad
+    k_pad = 0 if lds_layout == "kblock" else K_PAD
+    ROW_STRIDE_A = BLOCK_K + k_pad
+    ROW_STRIDE_B = BLOCK_K + k_pad
     LDS_A_SIZE = BLOCK_M * ROW_STRIDE_A
     LDS_B_SIZE = BLOCK_N * ROW_STRIDE_B
     LDS_ONE_BUF = LDS_A_SIZE + LDS_B_SIZE
@@ -237,16 +234,12 @@ def create_wmma_gemm_module(
 
     # The LDS row is written 128 bits at a time, so a pad that leaves the row
     # length off a vector boundary tears every write. The kernel still runs and
-    # quietly returns NaN, which is a bad way to find out: a_k_pad=4 at
-    # BLOCK_K=32 does exactly that.
-    if lds_layout == "pad":
-        for name, pad in (("a_k_pad", a_k_pad), ("b_k_pad", b_k_pad)):
-            if (BLOCK_K + pad) % LOAD_VEC:
-                raise ValueError(
-                    f"{name}={pad} leaves an LDS row of {BLOCK_K + pad} elements, "
-                    f"which is not a multiple of the {LOAD_VEC}-element vector "
-                    f"store; use a multiple of {LOAD_VEC}"
-                )
+    # quietly returns NaN, which is a bad way to find out.
+    if lds_layout == "pad" and (BLOCK_K + k_pad) % LOAD_VEC:
+        raise ValueError(
+            f"K_PAD={k_pad} leaves an LDS row of {BLOCK_K + k_pad} elements, "
+            f"which is not a multiple of the {LOAD_VEC}-element vector store"
+        )
 
     num_k_tiles = K // BLOCK_K
     if num_k_tiles < 2:
@@ -277,76 +270,23 @@ def create_wmma_gemm_module(
     assert stagger >= 0
     stagger_step = int(stagger) if num_k_tiles & (num_k_tiles - 1) == 0 else 0
 
-    # ── Stream-K ────────────────────────────────────────────────────────
+    # ── Persistent whole-tile grid ──────────────────────────────────────
     # One workgroup per output tile leaves the machine ragged whenever the tile
-    # count is not a multiple of the slot count, and it never is here: 2048 is a
-    # power of two, so a power-of-two tile cuts a power-of-two grid, and 96 CUs
-    # is 2^5*3. 256 tiles on 96 slots is 2.67 rounds of work that has to run as
-    # 3, and the tiles all take the same time so they stay in lockstep and the
-    # last round really is two thirds empty. Measured by holding the tile and
-    # the round count fixed and moving only the fill -- 2048x2304 (288 tiles,
-    # 3 rounds, 100%) runs 82.15 TFLOP/s against 2048x2048 (256 tiles, 3 rounds,
-    # 89%) at 73.34 -- it is worth 1.120x, against the 1.125x the fill predicts.
-    #
-    # Stream-K splits the tiles x k-tiles unit space evenly instead, so every
-    # workgroup gets the same amount of work and there is no tail. The price is
-    # that a tile whose units straddle a workgroup boundary is computed in two
-    # pieces that have to be added: the later workgroup writes its piece to a
-    # workspace and flags it, the earlier one waits and folds it in. Measured
-    # separately, that traffic is 11.26 us against the 25.1 us above.
-    #
-    # ``stream_k`` is the number of persistent workgroups. Two constraints:
-    #
-    #   * It may not exceed what the machine can hold resident, because the
-    #     waiter spins on a workgroup that must already be running. The producer
-    #     writes its piece as its *first* tile and the consumer wants it as its
-    #     *last*, so the wait is nearly always already satisfied, but a
-    #     non-resident producer would deadlock outright.
-    #   * num_tiles must be at least stream_k, which makes every unit range at
-    #     least num_k_tiles long and so caps a tile at two contributors. That is
-    #     what lets a workgroup write at most one partial and read at most one.
+    # count is not a multiple of the slot count. ``persistent_wgs=num_tiles``
+    # launches that many persistent workgroups; each owns a contiguous band of
+    # whole output tiles and runs them serially.
     num_tiles = grid_m * grid_n
-    sk_wgs = int(stream_k)
-    assert sk_wgs >= 0
-    if sk_wgs:
-        if sk_wgs > num_tiles:
-            raise ValueError(
-                f"stream_k={sk_wgs} needs at least that many tiles to keep a tile to two "
-                f"contributors; this shape cuts {num_tiles}"
-            )
-    sk_units = num_tiles * num_k_tiles
-    # When every range happens to land on a tile boundary nobody splits anything,
-    # and the whole partial/flag apparatus is dead weight that still costs: it
-    # spills 56 registers and makes the epilogue read a zero slot it does not
-    # need. That case is worth having because it is the one that wins -- at 2048
-    # cubed, 128 workgroups of two whole tiles each beat both the plain path and
-    # a splitting Stream-K -- so it gets a body with none of the machinery in it.
-    sk_no_split = bool(sk_wgs) and all(
-        (w * sk_units // sk_wgs) % num_k_tiles == 0 for w in range(sk_wgs)
-    )
-    if sk_wgs and not sk_no_split and (sk_wgs - 1) * sk_units > 2**31 - 1:
-        # The splitting path forms pid * num_tiles * num_k_tiles in i32 to find
-        # its unit range. Overflowing that wraps to a negative tile id, which
-        # faults rather than answering wrongly, so it is refused up front.
+    persist_wgs = int(persistent_wgs)
+    if persist_wgs not in (0, num_tiles):
         raise ValueError(
-            f"stream_k={sk_wgs} with {sk_units} units overflows the i32 unit "
-            f"space for this shape; use a count that divides into whole tiles"
+            f"persistent_wgs must be 0 (plain grid) or num_tiles={num_tiles} "
+            f"(whole-tile persistent), got {persist_wgs}"
         )
-    # Whole-tile wraparound is the wrong shape here, because a visit covers a
-    # slice of one tile's k rather than all of it. The same decorrelation still
-    # has to happen -- most visits are whole tiles that would otherwise all walk
-    # k in step, which is the 1.055x the plain path measured -- so it becomes a
-    # rotation inside the visit's own range instead.
-    sk_rot_step = int(stagger) if sk_wgs else 0
-    if sk_wgs:
+    # On the persistent path stagger rotates inside each tile's k walk instead
+    # of offsetting workgroups across the whole k dimension.
+    persist_rot_step = int(stagger) if persist_wgs else 0
+    if persist_wgs:
         stagger_step = 0
-    # One slot per workgroup, not per tile: a workgroup writes at most one
-    # partial, so the workspace is fixed at ~6 MB whatever the problem size.
-    # The extra slot on the end stays zero, so the epilogue can fold in a
-    # partial unconditionally and there is only ever one copy of it.
-    sk_zero_slot = sk_wgs
-    sk_ws_floats = 0 if sk_no_split else (sk_wgs + 1) * THREADS_PER_BLOCK * 8 * reg_m * reg_n
-    sk_flags = 0 if sk_no_split else sk_wgs
 
     is_bf16 = in_dtype == "bf16"
 
@@ -376,8 +316,6 @@ def create_wmma_gemm_module(
         arg_c: fx.Tensor,
         arg_a: fx.Tensor,
         arg_bt: fx.Tensor,
-        arg_ws: fx.Tensor,  # fp32 partials; only touched on the Stream-K path
-        arg_flag: fx.Tensor,  # one i32 per persistent workgroup, ditto
         tiled_mma: fx.TiledMma,
         tiled_copy_g2s: fx.TiledCopy,
         sr_seed: fx.Int32,  # runtime seed; only read on the stochastic-rounding path
@@ -414,22 +352,13 @@ def create_wmma_gemm_module(
         else:
             k_first = 0
 
-        def _k_tile(k_base, step, rot=None, n_iter=None):
-            """Global k-tile index of the ``step``-th tile of a visit to a tile.
-
-            Both staggered paths rotate the walk so concurrent workgroups sit at
-            different k, they just wrap around different spans: the plain path
-            around all of k, Stream-K around the visit's own slice of it. The
-            slice length is only known at run time, so the wrap is a compare and
-            a select rather than the plain path's mask.
-            """
+        def _k_tile(step, rot=None, n_iter=None):
+            """Global k-tile index for the ``step``-th tile of one output-tile visit."""
             if const_expr(stagger_step):
                 return (k_first + fx.Int32(step)) % num_k_tiles
-            if const_expr(sk_rot_step):
+            if const_expr(persist_rot_step):
                 kk = rot + fx.Int32(step)
-                return k_base + (kk >= n_iter).select(kk - n_iter, kk)
-            if const_expr(sk_wgs):
-                return k_base + fx.Int32(step)
+                return (kk >= n_iter).select(kk - n_iter, kk)
             return step
 
         wave_m = wave_id // waves_n
@@ -451,12 +380,7 @@ def create_wmma_gemm_module(
         thr_r2g_C = fx.make_tiled_copy_C(copy_out, tiled_mma).get_slice(tid)
 
         def _tile_operands(bid_m, bid_n):
-            """The A and B row bands this tile reads, partitioned per thread.
-
-            Built per visit rather than once, because a Stream-K workgroup walks
-            several tiles and each wants a different band. On the plain path
-            there is exactly one visit and this folds back to what it was.
-            """
+            """The A and B row bands this tile reads, partitioned per thread."""
             tA = fx.flat_divide(fx.rocdl.make_buffer_tensor(arg_a), fx.make_tile(BLOCK_M, BLOCK_K))[
                 None, None, bid_m, None
             ]
@@ -622,80 +546,33 @@ def create_wmma_gemm_module(
             _barrier()
             return s_accs
 
-        def _accumulate(pA_g, pB_g, k_base, n_iter, rot=None):
-            """Run the double-buffered pipeline over ``n_iter`` k-tiles.
-
-            ``n_iter`` is a Python int on the plain path, so the trip count and
-            the closing buffer parity both fold at trace time and the loop comes
-            out exactly as it did before Stream-K existed. On the Stream-K path
-            it is a runtime value and both become ordinary SSA; a range of one
-            k-tile is fine, the loop simply runs zero trips and the epilogue
-            consumes what the prologue put in buffer 0.
-            """
-            if const_expr(sk_wgs):
+        def _accumulate(pA_g, pB_g, rot=None):
+            """Run the double-buffered pipeline over all k-tiles of one output tile."""
+            if const_expr(persist_wgs):
                 # A previous visit's closing _compute_k_tile may still be
                 # reading the buffer this prologue is about to overwrite.
                 _barrier()
             # --- PROLOGUE ---
-            _gmem_load(pA_g, pB_g, _k_tile(k_base, fx.Int32(0), rot, n_iter))
+            _gmem_load(pA_g, pB_g, _k_tile(fx.Int32(0), rot, num_k_tiles))
             _lds_store(0)
             _barrier()
 
             init_state = [zero_acc for _ in range_constexpr(n_acc)]
 
-            # The read buffer alternates with the trip counter, so both offsets
-            # are values derived from ``iv`` and the body spends ~10 VALU and
-            # SALU ops per trip on them. Stepping the loop by two fixes each
-            # half's parity at trace time and folds the arithmetic into ds_load
-            # immediates: overhead instructions drop from 0.93 to 0.31 per WMMA
-            # and VGPRs from 212 to 204. It is 1.7% slower (104.0 -> 105.8 ms at
-            # 16384 cubed). The loop is not issue-bound, so paying more
-            # instructions is not what it costs.
-            for iv, state in range(0, n_iter - 1, 1, init=init_state):
+            for iv, state in range(0, num_k_tiles - 1, 1, init=init_state):
                 s_accs = list(state[:n_acc])
                 s_accs = _one_k_tile(pA_g, pB_g, s_accs, iv % 2 * c_lds_buf_stride,
                                      (1 - iv % 2) * c_lds_buf_stride,
-                                     _k_tile(k_base, iv + 1, rot, n_iter))
+                                     _k_tile(iv + 1, rot, num_k_tiles))
                 results = yield list(s_accs)
 
             return _compute_k_tile(list(results[:n_acc]),
-                                   ((n_iter - 1) % 2) * c_lds_buf_stride)
-
-        if const_expr(sk_wgs and not sk_no_split):
-            # Offsets go through make_int_tuple as Int32, the way the LDS
-            # helpers do: tid is index-typed and the slot is not, and handing
-            # the mix straight to pointer arithmetic cannot be typed.
-            ws_base = fx.get_iter(arg_ws)
-            flag_base = fx.get_iter(arg_flag)
-            tid32 = fx.Int32(tid)
-
-            def _ws_slot(slot, g):
-                """The 8 floats of accumulator group ``g`` for this thread."""
-                off = fx.Int32(slot) * (THREADS_PER_BLOCK * acc_size) + (
-                    fx.Int32(g * THREADS_PER_BLOCK) + tid32
-                ) * 8
-                ptr = fx.add_offset(ws_base, fx.make_int_tuple(off))
-                return fx.make_view(fx.recast_iter(fx.Float32, ptr), fx.make_layout(8, 1))
-
-            def _flag_ptr(slot):
-                return fx.add_offset(flag_base, fx.make_int_tuple(fx.Int32(slot))).llvm_ptr
-
-            def _flag_load(slot):
-                return _llvm.LoadOp(
-                    T.i32, _flag_ptr(slot), alignment=4,
-                    ordering=_llvm.AtomicOrdering.acquire, syncscope="agent",
-                ).result
-
-            def _flag_store(slot, value, ordering):
-                _llvm.StoreOp(
-                    as_ir_value(fx.Int32(value)), _flag_ptr(slot), alignment=4,
-                    ordering=ordering, syncscope="agent",
-                )
+                                   ((num_k_tiles - 1) % 2) * c_lds_buf_stride)
 
         # ============================================================
         # Store results to GMEM through the tiled copy
         # ============================================================
-        def _store_C(accs, bid_m, bid_n, seed_slot, merge_slot=None):
+        def _store_C(accs, bid_m, bid_n, seed_slot):
             # The gfx11 v8f32 accumulator (lane L holds D[2*si + L/16][L%16]) and
             # the wave banding are both encoded in the tiled_mma, so the row
             # arithmetic that used to live here is gone. What remains is the
@@ -714,15 +591,6 @@ def create_wmma_gemm_module(
             else:
                 frag_C_out = fx.make_fragment_like(frag_C, out_elem_cls.ir_type)
             frag_C_retile = thr_r2g_C.retile(frag_C_out)
-
-            # Folding a Stream-K partial in belongs here rather than at the call
-            # site. Done there it straddles a runtime branch, so the incoming
-            # and the summed accumulators are both live across the region --
-            # 2 x 16 v8f32 on a kernel already sitting at 256 VGPRs, which cost
-            # 284 spilled registers and 0.83x. Here each group's sum kills the
-            # value it came from, so only one set is ever live.
-            if const_expr(merge_slot is not None):
-                accs = [accs[g] + _ws_slot(merge_slot, g).load() for g in range_constexpr(n_acc)]
 
             ordered_accs = [accs[rm * reg_n + rn] for rn in range_constexpr(reg_n) for rm in range_constexpr(reg_m)]
             if const_expr(rounding == "rs"):
@@ -749,108 +617,27 @@ def create_wmma_gemm_module(
             )
             fx.copy(copy_out, frag_C_retile, pC_g)
 
-        if const_expr(not sk_wgs):
+        if const_expr(not persist_wgs):
             bid_m, bid_n = _swizzle_tile_id(pid, grid_n, group_width)
             pA_g, pB_g = _tile_operands(bid_m, bid_n)
-            accs = _accumulate(pA_g, pB_g, 0, num_k_tiles)
+            accs = _accumulate(pA_g, pB_g)
             _store_C(accs, bid_m, bid_n, pid)
         else:
-            # ── Stream-K ────────────────────────────────────────────
-            # Workgroup w owns units [w*U/W, (w+1)*U/W) of the tiles x k-tiles
-            # space. Every range is at least num_k_tiles long, so a tile has at
-            # most two contributors: the workgroup holding its k=0 owns it, and
-            # the next workgroup along may hold a suffix. That caps this
-            # workgroup at one partial written (its first tile, if it starts
-            # mid-tile) and one partial read (its last, if it ends mid-tile).
+            # ── Persistent whole-tile grid ──────────────────────────
             pid32 = fx.Int32(pid)
-            if const_expr(sk_no_split):
-                # Whole tiles only, so the range can be taken in tile space and
-                # the unit space never has to be formed. It also must not be:
-                # pid * num_tiles * num_k_tiles passes 2^31 at 12288 square,
-                # which wrapped to a negative tile id and faulted the GPU.
-                t_first = pid32 * num_tiles // sk_wgs
-                t_last = (pid32 + 1) * num_tiles // sk_wgs - 1
-            else:
-                unit_begin = pid32 * sk_units // sk_wgs
-                unit_end = (pid32 + 1) * sk_units // sk_wgs
-                t_first = unit_begin // num_k_tiles
-                t_last = (unit_end - 1) // num_k_tiles
-                k_lo_first = unit_begin - t_first * num_k_tiles
-                k_hi_last = unit_end - t_last * num_k_tiles
+            t_first = pid32 * num_tiles // persist_wgs
+            t_last = (pid32 + 1) * num_tiles // persist_wgs - 1
 
             for t, _carry in range(t_first, t_last + 1, 1, init=[fx.Int32(0)]):
                 t32 = fx.Int32(t)
                 bid_m, bid_n = _swizzle_tile_id(t32, grid_n, group_width)
                 pA_g, pB_g = _tile_operands(bid_m, bid_n)
-                if const_expr(sk_no_split):
-                    # Whole tiles only, so the trip count and the closing buffer
-                    # parity are Python ints again and the pipeline comes out
-                    # exactly as it does on the plain path.
-                    k_lo, n_iter = fx.Int32(0), num_k_tiles
-                else:
-                    k_lo = (t32 == t_first).select(k_lo_first, fx.Int32(0))
-                    k_hi = (t32 == t_last).select(k_hi_last, fx.Int32(num_k_tiles))
-                    n_iter = k_hi - k_lo
-                if const_expr(sk_rot_step):
-                    rot = pid32 * sk_rot_step % fx.Int32(n_iter)
+                if const_expr(persist_rot_step):
+                    rot = pid32 * persist_rot_step % fx.Int32(num_k_tiles)
                 else:
                     rot = None
-                accs = _accumulate(pA_g, pB_g, k_lo, n_iter, rot)
-
-                if const_expr(sk_no_split):
-                    _store_C(accs, bid_m, bid_n, t32)
-                elif k_lo > fx.Int32(0):
-                    # Someone else owns this tile's k=0. Park the piece in our
-                    # own slot -- thread tid writes what thread tid of the owner
-                    # will want, so the fragment never has to be reshaped -- and
-                    # release. vmcnt drains this thread's stores, the barrier
-                    # covers the rest of the block, and only then is the flag
-                    # allowed to become visible.
-                    #
-                    # One thread raises it, because the flag is also the thing
-                    # that has to come back down: with all 128 raising it, a
-                    # straggler wave can re-raise it after the consumer has
-                    # already lowered it, and the launch ends with it stuck up.
-                    for g in range_constexpr(n_acc):
-                        _ws_slot(pid32, g).store(accs[g])
-                    rocdl.s_waitcnt(vmcnt=0)
-                    _barrier()
-                    if tid32 == fx.Int32(0):
-                        _flag_store(pid32, 1, _llvm.AtomicOrdering.release)
-                else:
-                    # We own this tile's k=0. If we do not also own its tail,
-                    # the producer is the next workgroup, which computed this as
-                    # its *first* tile, so the flag is nearly always already up
-                    # by the time we reach the end of our own range.
-                    #
-                    # The epilogue then folds that partial in unconditionally,
-                    # reading a slot that is the producer's or, when there is
-                    # nothing to fold, a spare slot left at zero. Branching to
-                    # two epilogues instead costs more than the wasted adds: it
-                    # doubles ~1400 lines of the tile loop's body and spills 80
-                    # registers, and the wasted reads all hit the one zero slot,
-                    # so they stay in L2.
-                    nxt = pid32 + fx.Int32(1)
-                    need_merge = k_hi < fx.Int32(num_k_tiles)
-                    if need_merge:
-                        # One thread waits and then lowers the flag again for the
-                        # next launch, and the barrier is what lets the other
-                        # waves past. Waiting in all 128 instead is what hung:
-                        # whichever wave got there first lowered the flag out
-                        # from under the ones still reading it, and those spun
-                        # for a producer that had long since finished. The
-                        # acquire and its cache invalidate are also what make
-                        # the partial visible, and they only have to happen once
-                        # per workgroup because a workgroup is one CU's worth of
-                        # waves sharing one L0.
-                        if tid32 == fx.Int32(0):
-                            flag_val = _flag_load(nxt)
-                            while flag_val == fx.Int32(0):
-                                flag_val = _flag_load(nxt)
-                            _flag_store(nxt, 0, _llvm.AtomicOrdering.monotonic)
-                        _barrier()
-                    _store_C(accs, bid_m, bid_n, t32,
-                             merge_slot=need_merge.select(nxt, fx.Int32(sk_zero_slot)))
+                accs = _accumulate(pA_g, pB_g, rot)
+                _store_C(accs, bid_m, bid_n, t32)
                 _ = yield [fx.Int32(0)]
 
     @flyc.jit
@@ -858,8 +645,6 @@ def create_wmma_gemm_module(
         arg_c: fx.Tensor,
         arg_a: fx.Tensor,
         arg_bt: fx.Tensor,
-        arg_ws: fx.Tensor,
-        arg_flag: fx.Tensor,
         stream: fx.Stream,
         sr_seed: fx.Int32 = 0,
     ):
@@ -893,15 +678,12 @@ def create_wmma_gemm_module(
         arg_bt_2d = fx.make_view(fx.get_iter(arg_bt), fx.make_layout((N, K), (ld_b, 1)))
         arg_c_2d = fx.make_view(fx.get_iter(arg_c), fx.make_layout((M, N), (ld_c, 1)))
 
-        ws_1d = fx.make_view(fx.get_iter(arg_ws), fx.make_layout(max(sk_ws_floats, 1), 1))
-        flag_1d = fx.make_view(fx.get_iter(arg_flag), fx.make_layout(max(sk_flags, 1), 1))
-
         c1 = 1
-        total_blocks = sk_wgs if sk_wgs else grid_m * grid_n
+        total_blocks = persist_wgs if persist_wgs else grid_m * grid_n
         bk = THREADS_PER_BLOCK
 
         launcher = wmma_gemm_kernel(
-            arg_c_2d, arg_a_2d, arg_bt_2d, ws_1d, flag_1d, tiled_mma, tiled_copy_g2s, sr_seed
+            arg_c_2d, arg_a_2d, arg_bt_2d, tiled_mma, tiled_copy_g2s, sr_seed
         )
         launcher.launch(
             grid=(total_blocks, c1, c1),
@@ -909,28 +691,7 @@ def create_wmma_gemm_module(
             stream=stream,
         )
 
-    if not sk_ws_floats:
-        # Nothing to thread through, either because this is the plain path or
-        # because no range splits a tile, but the kernel signature carries the
-        # two arguments either way, so hand it something valid and untouched.
-        def launch(arg_c, arg_a, arg_bt, stream, sr_seed=0):
-            return launch_gemm(arg_c, arg_a, arg_bt, arg_c, arg_c, stream, sr_seed)
-
-        return launch, BLOCK_M, BLOCK_N, BLOCK_K
-
-    # Stream-K's scratch is sized by the persistent grid, not by the problem, so
-    # one allocation serves every call this module makes. The flags have to
-    # start at zero and every launch leaves them that way again, and so does the
-    # spare slot on the end of the workspace, which nothing ever writes.
-    state = {}
-
     def launch(arg_c, arg_a, arg_bt, stream, sr_seed=0):
-        if not state:
-            import torch
-
-            dev = arg_c.device
-            state["ws"] = torch.zeros(sk_ws_floats, device=dev, dtype=torch.float32)
-            state["flag"] = torch.zeros(sk_wgs, device=dev, dtype=torch.int32)
-        return launch_gemm(arg_c, arg_a, arg_bt, state["ws"], state["flag"], stream, sr_seed)
+        return launch_gemm(arg_c, arg_a, arg_bt, stream, sr_seed)
 
     return launch, BLOCK_M, BLOCK_N, BLOCK_K

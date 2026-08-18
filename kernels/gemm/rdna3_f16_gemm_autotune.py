@@ -47,7 +47,6 @@ LDS_BYTES = 64 * 1024
 
 # Named by the block tile they produce: (reg_m, reg_n, reg_k, waves_m, waves_n).
 TILE_256x256x32 = (4, 4, 2, 4, 4)
-TILE_128x256x32 = (4, 4, 2, 2, 4)
 TILE_128x128x32 = (4, 4, 2, 2, 2)
 TILE_128x64x32 = (4, 2, 2, 2, 2)
 TILE_64x64x64 = (2, 2, 4, 2, 2)
@@ -82,7 +81,6 @@ TILE_32x32x64 = (2, 2, 4, 1, 1)
 _DEFAULT_OPTS = {"lds_layout": "pad", "sched_hint": False, "group_m": 8, "stagger": 1}
 _TILE_OPTS = {
     TILE_256x256x32: {"lds_layout": "kblock", "sched_hint": False, "group_m": 16, "stagger": 1},
-    TILE_128x256x32: {"lds_layout": "pad", "sched_hint": True, "group_m": 16, "stagger": 1},
     TILE_128x128x32: {"lds_layout": "pad", "sched_hint": True, "group_m": 8, "stagger": 1},
 }
 
@@ -101,7 +99,7 @@ def tile_opts(tile):
 # The ladder is the feasibility-ordered search space; pick_tile does not walk it
 # in order. 32x64x64 is here only as a fallback for shapes the others cannot
 # divide -- it was not the fastest tile on any of the 27 shapes swept.
-_LADDER_LARGE_K = [TILE_256x256x32, TILE_128x256x32, TILE_128x128x32, TILE_64x64x64,
+_LADDER_LARGE_K = [TILE_256x256x32, TILE_128x128x32, TILE_64x64x64,
                    TILE_32x64x64, TILE_32x32x64]
 _LADDER_SMALL_K = [TILE_128x128x32, TILE_128x64x32, TILE_64x64x64, TILE_32x64x64, TILE_32x32x64]
 
@@ -233,21 +231,13 @@ def _tile_config(tile):
     return Config(**dict(zip(_TILE_FIELDS, tile)))
 
 
-# One whole tile per persistent workgroup. This is not Stream-K: with stream_k
-# equal to the tile count every range is exactly one tile's k, so nothing splits,
-# no partial is ever written, and the kernel is built without the workspace or
-# the flags at all. Same grid, same tiles, same order as the plain path -- only a
-# different code shape for identical work -- and yet at 128x128x32 it is faster
-# everywhere it was measured: 2048 cubed 1.030x, 4096x2048x8192 1.017x,
-# 2048x4096x8192 1.016x, 3072x3072x1024 1.009x. Why is not established. It is not
-# the extra entry barrier, which put on the plain path alone changes nothing, and
-# the emitted code is 50 lines and 3 spills *worse* than the plain path's.
+# One whole tile per persistent workgroup. ``persistent_wgs=num_tiles`` gives every
+# workgroup a band of whole tiles; only 0 or num_tiles is accepted by the kernel.
 #
 # Not knowing the mechanism is why this is allowed at one tile rather than by a
 # size threshold: the effect does not generalise across tiles and going wider is
-# where it turns. 128x256x32 is a coin flip (5120 cubed 1.043x, but 4096 cubed
-# 1.004x, 4096x11008x4096 0.996x, 8192 cubed 0.989x, 12288x12288x4096 0.996x) and
-# 256x256x32 is a rout, losing 14% at both 16384x16384x2048 and x4096. The small
+# where it turns. 256x256x32 is a rout, losing 14% at both 16384x16384x2048 and
+# x4096. The small
 # tiles lose 1-2.5% (512 square, 512x512x2048, 256x256x4096), where the whole
 # kernel is tens of microseconds and one more loop around the body never
 # amortizes.
@@ -285,7 +275,7 @@ def _build(M, N, K, in_dtype, out_dtype, rounding, reg_m, reg_n, reg_k, waves_m,
         lda=lda,
         ldb=ldb,
         ldc=ldc,
-        stream_k=persistent_wgs(M, N, K, (reg_m, reg_n, reg_k, waves_m, waves_n)),
+        persistent_wgs=persistent_wgs(M, N, K, (reg_m, reg_n, reg_k, waves_m, waves_n)),
         **opts,
     )
     return launch_fn
