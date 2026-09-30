@@ -1,0 +1,22 @@
+{
+ "schema": 1,
+ "updated": "2026-09-30T02:05:33Z",
+ "repo": "vlluvia/FlyDSL",
+ "runs": [
+  {
+   "run_id": 36658134612,
+   "pr": 1,
+   "commit": "038ec9eb285fe574def9586aceceb990fd3c7a7e",
+   "branch": "kernel/gfx1100-flash-attn",
+   "event": "pull_request",
+   "title": "[Kernel] Add dense Flash Attention for gfx1100",
+   "status": "completed",
+   "conclusion": "failure",
+   "url": "https://github.com/vlluvia/FlyDSL/actions/runs/36658134612",
+   "created_at": "2026-09-30T02:04:39Z",
+   "updated_at": "2026-09-30T02:05:23Z",
+   "actor": "vlluvia",
+   "jobs": []
+  }
+ ]
+}
