@@ -221,12 +221,24 @@ def WMMA(m, n, k, elem_ty_ab, elem_ty_acc=None, **kwargs):
     )
 
 
-def make_buffer_ptr(ptr: Pointer, num_records_bytes=None):
+def make_buffer_ptr(ptr: Pointer, num_records_bytes=None, *, bounds_checked: bool = False):
     """Construct a new buffer-resource (``BufferDesc``) pointer from a global
     pointer, for hardware OOB-checked loads / stores.
 
     ``num_records_bytes`` is the descriptor byte count.  When ``None``
     (default) it falls back to the max size ``0xFFFFFFFF``.
+
+    ``bounds_checked`` asks the hardware to actually enforce that byte count on
+    a raw buffer, so a load past it returns zero and a store past it is dropped.
+    It is only meaningful on RDNA, where the descriptor this builds otherwise
+    selects the out-of-bounds mode that fires only on an empty buffer -- i.e.
+    never, for any descriptor worth making.  CDNA's mode already checks against
+    ``num_records``, so there the flag changes nothing and is accepted so
+    callers need not branch on the target.
+
+    Leaving it off remains the default because the check costs address
+    arithmetic the common sliced access does not need: it is a way to let a
+    *deliberately* out-of-range address be a no-op, not a safety net.
     """
     if not is_generic_address_space(ptr.address_space, AddressSpace.Global):
         raise ValueError(f"make_buffer_ptr requires a global-address-space pointer, got {ptr.address_space}")
@@ -245,7 +257,10 @@ def make_buffer_ptr(ptr: Pointer, num_records_bytes=None):
     flags = (7 << 12) | (4 << 15)
     if is_rdna_arch(arch):
         flags |= 1 << 24  # reserved bit, must be 1 on RDNA
-        flags |= 2 << 28  # OOB_SELECT = 2 (no bounds checking)
+        # OOB_SELECT: 3 bounds a raw buffer at num_records (the test is
+        # "offset >= NumRecords"); 2 tests "NumRecords == 0", which on a
+        # descriptor built over real memory is no bounds checking at all.
+        flags |= (3 if bounds_checked else 2) << 28
 
     buf_ptr_ty = PointerType.get(
         elem_ty=elem_ty.ir_type,
@@ -268,6 +283,7 @@ def make_buffer_tensor(
     max_size: bool = True,
     *,
     num_records_bytes=None,
+    bounds_checked: bool = False,
 ) -> Tensor:
     """Construct a new buffer-resource-backed tensor from a global-pointer
     tensor, for hardware OOB-checked loads / stores and buffer_copy atoms
@@ -278,6 +294,9 @@ def make_buffer_tensor(
     Pass ``num_records_bytes`` when the byte count is a compile-time
     constant (folds to a constant in IR).  Otherwise with ``max_size=False``
     it is derived at runtime from ``cosize(layout) * elem_bytes``.
+
+    ``bounds_checked`` makes the hardware enforce that byte count; see
+    :func:`make_buffer_ptr`.
     """
     elem_ty = tensor.element_type
 
@@ -292,7 +311,7 @@ def make_buffer_tensor(
         else:
             num_records_bytes = Int64((get_scalar(cosize(layout)) * elem_bits + 7) // 8)
 
-    buf_ptr = make_buffer_ptr(ptr, num_records_bytes=num_records_bytes)
+    buf_ptr = make_buffer_ptr(ptr, num_records_bytes=num_records_bytes, bounds_checked=bounds_checked)
     return make_view(buf_ptr, layout)
 
 
